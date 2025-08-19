@@ -12,6 +12,8 @@ import {
 import { addChunksToRecording, createRecording } from "./lib/indexedDB";
 import Recordings from "./components/Recordings";
 import { v4 as uuidv4 } from "uuid";
+import Connections from "./components/Connections";
+import { floatToPCM16, SAMPLE_RATE } from "./lib/audioUtils";
 
 export const MIME_TYPE = "audio/webm";
 
@@ -26,6 +28,12 @@ function App() {
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
   const BUFFER_FLUSH_LIMIT = 10; // Save to indexeddb when buffer reaches this limit
+  const websocketConnection = useRef<WebSocket | null>(null);
+
+  // Web Audio API refs for PCM processing
+  const audioContext = useRef<AudioContext | null>(null);
+  const audioWorkletNode = useRef<AudioWorkletNode | null>(null);
+  const sourceNode = useRef<MediaStreamAudioSourceNode | null>(null);
 
   const triggerRefresh = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -59,6 +67,20 @@ function App() {
     getAudioDevices();
   }, [selectedDeviceId]);
 
+  const streamPCMData = (pcmData: Float32Array) => {
+    if (
+      websocketConnection.current &&
+      websocketConnection.current.readyState === WebSocket.OPEN
+    ) {
+      // Convert Float32Array to Int16Array PCM using utility function
+      const int16Data = floatToPCM16(pcmData);
+
+      // Send as ArrayBuffer
+      websocketConnection.current.send(int16Data.buffer);
+      console.log("Sent PCM data to WebSocket, samples:", int16Data.length);
+    }
+  };
+
   const startRecording = async () => {
     // Create stream with selected audio device as source
     const constraints = {
@@ -68,7 +90,46 @@ function App() {
     mediaStream.current =
       await navigator.mediaDevices.getUserMedia(constraints);
 
-    // Create MediaRecorder instance with stream
+    // Set up Web Audio API for PCM processing
+    audioContext.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+    sourceNode.current = audioContext.current.createMediaStreamSource(
+      mediaStream.current,
+    );
+
+    // Create AudioWorklet for real-time PCM processing
+    try {
+      await audioContext.current.audioWorklet.addModule("/pcm-processor.js");
+      audioWorkletNode.current = new AudioWorkletNode(
+        audioContext.current,
+        "pcm-processor",
+      );
+
+      // Handle PCM data from worklet
+      audioWorkletNode.current.port.onmessage = (event) => {
+        const pcmData = event.data;
+        streamPCMData(pcmData);
+      };
+
+      sourceNode.current.connect(audioWorkletNode.current);
+    } catch (error) {
+      console.warn(
+        "AudioWorklet not supported, falling back to ScriptProcessor",
+      );
+      // Fallback to ScriptProcessorNode (deprecated but more compatible)
+      const scriptProcessor = audioContext.current.createScriptProcessor(
+        4096,
+        1,
+        1,
+      );
+      scriptProcessor.onaudioprocess = (event) => {
+        const inputData = event.inputBuffer.getChannelData(0);
+        streamPCMData(inputData);
+      };
+      sourceNode.current.connect(scriptProcessor);
+      scriptProcessor.connect(audioContext.current.destination);
+    }
+
+    // Create MediaRecorder instance with stream for file recording
     mediaRecorder.current = new MediaRecorder(mediaStream.current);
 
     // Start recording
@@ -91,6 +152,10 @@ function App() {
       if (event.data.size > 0) {
         recordingBuffer.current.push(event.data);
         console.log("recordingBuffer:", recordingBuffer);
+
+        // Note: WebM chunks still saved to IndexedDB for file recording
+        // PCM data is streamed separately via Web Audio API
+
         if (recordingBuffer.current.length >= BUFFER_FLUSH_LIMIT) {
           addChunksToRecording(recordingId.current, recordingBuffer.current);
           recordingBuffer.current = [];
@@ -115,6 +180,20 @@ function App() {
   const stopRecording = () => {
     if (mediaRecorder.current && mediaRecorder.current.state === "recording") {
       mediaRecorder.current.stop();
+    }
+
+    // Clean up Web Audio API resources
+    if (audioWorkletNode.current) {
+      audioWorkletNode.current.disconnect();
+      audioWorkletNode.current = null;
+    }
+    if (sourceNode.current) {
+      sourceNode.current.disconnect();
+      sourceNode.current = null;
+    }
+    if (audioContext.current) {
+      audioContext.current.close();
+      audioContext.current = null;
     }
   };
 
@@ -206,6 +285,15 @@ function App() {
               Resume
             </Button>
           </div>
+        </CardContent>
+      </Card>
+      <Card className="w-full max-w-lg">
+        <CardHeader>Connections:</CardHeader>
+        <CardContent>
+          <Connections
+            isRecording={isRecording}
+            websocketConnection={websocketConnection}
+          />
         </CardContent>
       </Card>
       <Card className="w-full max-w-lg">
